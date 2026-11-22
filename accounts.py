@@ -195,6 +195,8 @@ def error_text(error):
         "SendCodeUnavailableError": "Telegram сейчас не может выдать код. Повторите позже или импортируйте сессию.",
         "InviteRequestSentError": "Заявка на вступление отправлена; нужно одобрение администратора.",
         "ChatWriteForbiddenError": "У аккаунта нет права писать в этот чат.",
+        "MsgIdInvalidError": "Telegram не нашёл указанный пост или сообщение ветки обсуждения. "
+                             "Оно могло быть удалено либо недоступно аккаунту.",
         "UserBannedInChannelError": "Аккаунт заблокирован в этом чате.",
         "ChannelPrivateError": "Нет доступа к группе или каналу.",
         "ChatAdminRequiredError": "Для этого действия нужны права администратора.",
