@@ -24,9 +24,14 @@ def group_posts(messages, count=None):
         if not isinstance(message, types.Message) or not message.post:
             continue
         key = f"album:{message.grouped_id}" if message.grouped_id else f"post:{message.id}"
+        comments_available = bool(message.replies and message.replies.comments)
         if key not in groups:
-            groups[key] = {"post_id": message.id, "post_key": key}
-        else:
+            groups[key] = {"post_id": message.id, "post_key": key,
+                           "comments_available": comments_available}
+        elif comments_available and not groups[key]["comments_available"]:
+            groups[key]["post_id"] = message.id
+            groups[key]["comments_available"] = True
+        elif comments_available == groups[key]["comments_available"]:
             groups[key]["post_id"] = min(groups[key]["post_id"], message.id)
     posts = list(groups.values())
     return posts if count is None else posts[:count]
@@ -45,7 +50,11 @@ async def latest_posts(client, channel, count):
 
 async def discussion(client, channel, post_id, dialogs, rpc=None):
     request = functions.messages.GetDiscussionMessageRequest(input_peer(channel), post_id)
-    result = await rpc(lambda: client(request)) if rpc else await client(request)
+    try:
+        result = await rpc(lambda: client(request)) if rpc else await client(request)
+    except errors.MsgIdInvalidError:
+        raise InputError("Telegram не вернул ветку комментариев этого поста (MSG_ID_INVALID). "
+                         "Пост или сообщение обсуждения могли быть удалены, либо комментарии недоступны.") from None
     roots = [message for message in result.messages
              if isinstance(message.peer_id, types.PeerChannel)
              and message.peer_id.channel_id != channel["raw_id"]]
@@ -79,42 +88,46 @@ async def linked_discussion(client, channel, dialogs, rpc=None):
     return pack(group, group_id in dialogs, "", "public", getattr(group, "username", "") or "")
 
 
-async def prepare(client, targets, issues=None, mode="latest", post_count=3):
+async def prepare(client, targets, issues=None, mode="latest", post_count=3, prepared=None):
     if mode not in MODES:
         raise InputError("Выберите режим комментирования")
     issues = issues if issues is not None else []
     channels = await prepare_targets(client, targets, issues)
     dialogs = {utils.get_peer_id(d.entity): d.entity async for d in client.iter_dialogs()}
-    result = []
+    result = prepared if prepared is not None else []
     for channel in channels:
         try:
             if not channel.get("broadcast"):
-                raise InputError("Нужна ссылка на канал с публикациями")
+                raise InputError("Получатель является группой/чатом. Для комментариев под постами нужна ссылка на канал")
             channel["posts"] = []
+            channel["joined"] = True
             if mode == "watch":
                 group = await linked_discussion(client, channel, dialogs)
                 channel["discussion_title"] = group["title"]
                 channel["joined"] = group["joined"]
+                result.append(channel)
             else:
                 count = 1 if mode == "latest" else post_count
                 posts = await latest_posts(client, channel, count)
                 if not posts:
                     raise InputError("В канале нет доступных публикаций")
+                result.append(channel)
                 for post in posts:
                     record = post_record(channel, post)
                     try:
+                        if not post["comments_available"]:
+                            raise InputError("Telegram не указывает доступные комментарии у этого поста")
                         try:
                             record.update(await discussion(client, channel, post["post_id"], dialogs))
                         except (errors.UserNotParticipantError, errors.ChannelPrivateError):
                             record["discussion"] = await linked_discussion(client, channel, dialogs)
                             record["reply_id"] = None
                         channel["posts"].append(record)
+                        channel["joined"] = all(p["discussion"]["joined"] for p in channel["posts"])
                     except errors.FloodWaitError:
                         raise
                     except Exception as exc:
                         issues.append({**record, "reason": error_text(exc)})
-                channel["joined"] = all(post["discussion"]["joined"] for post in channel["posts"])
-            result.append(channel)
         except errors.FloodWaitError:
             raise
         except Exception as exc:
@@ -189,6 +202,10 @@ class Runner(BaseRunner):
     async def process_post(self, client, job, account, channel, post, snapshot, dialogs):
         item = post_record(channel, post)
         if self.store.recorded(job, 0, account, item["id"]):
+            return
+        if post.get("comments_available") is False:
+            self.record_failure(job, account, item,
+                                InputError("Telegram не указывает доступные комментарии у этого поста"))
             return
         try:
             # Resolve again before sending in case the discussion changed since preview.
