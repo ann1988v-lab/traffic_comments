@@ -10,20 +10,53 @@ import time
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup as Keyboard
-from telegram.error import TimedOut
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (Application, BaseUpdateProcessor, CallbackQueryHandler,
                           CommandHandler, MessageHandler, filters)
 from telethon import errors
 from telethon.sessions import StringSession
 
 from accounts import (InputError, api_options, error_text, from_key, from_sqlite,
-                      from_tdata, make_client, parse_json, validate)
+                      from_tdata, make_client, parse_json, validate, disconnect_after_check)
 from delivery import parse_targets, report_csv
 from comments import MODES, Runner, prepare
 from storage import Store
 
 ROOT = Path(__file__).resolve().parent
 MAX_UPLOAD = 18 * 1024 * 1024
+PREVIEW_TIMEOUT = 120
+
+
+def log_panel_error(update, error, operation=None):
+    if operation is None:
+        operation = "polling/background"
+        if update is not None:
+            query = getattr(update, "callback_query", None)
+            if query:
+                action = str(query.data).split(":", 1)[0]
+                actions = {"menu", "settings", "timing", "modes", "mode", "setting", "set", "custom",
+                           "help", "add", "accounts", "toggle", "delete", "remove", "import", "message",
+                           "targets", "preview", "run", "resume", "status", "stop", "journal"}
+                operation = "callback/" + (action if action in actions else "unknown")
+            else:
+                operation = "message"
+    detail = type(error).__name__
+    if isinstance(error, NetworkError):
+        detail = str(error)
+        for name in ("BOT_TOKEN", "TELEGRAM_API_HASH", "ENCRYPTION_KEY"):
+            secret = os.environ.get(name)
+            if secret:
+                detail = detail.replace(secret, "[secret]")
+        detail = re.sub(r"https?://\S+", "[URL]", detail)
+        detail = re.sub(r"\b[0-9]{5,}:[A-Za-z0-9_-]+", "[token]", detail)
+        detail = re.sub(r"\b[a-fA-F0-9]{32,}\b", "[key]", detail)
+        detail = re.sub(r"\b[A-Za-z0-9_-]{40,}={0,2}", "[identifier]", detail)
+        detail = re.sub(r"\+?[0-9]{8,15}", "[number]", detail)
+        detail = " ".join(detail.split())[:350]
+    cause = error.__cause__
+    logging.getLogger("panel").error("Handler failed: %s | operation=%s | reason=%s | cause=%s",
+                                     type(error).__name__, operation, detail,
+                                     type(cause).__name__ if cause else "none")
 
 
 def keyboard(rows):
@@ -275,7 +308,10 @@ class Panel:
         if not allowed(update, self.owner):
             await query.answer("Нет доступа", show_alert=True)
             return
-        await query.answer()
+        try:
+            await query.answer()
+        except (NetworkError, BadRequest) as exc:
+            log_panel_error(update, exc, "answerCallbackQuery")
         action = query.data
         message = query.message
         try:
@@ -384,8 +420,8 @@ class Panel:
                 job = self.store.job(job_id)
                 if action.startswith("run:") and job["state"] != "draft":
                     raise InputError("Этот план уже запускался. Используйте статус или создайте новый")
-                await message.reply_text(f"Запускаю задачу {job_id}. Остановка: /stop")
                 self.runner.launch(job_id)
+                await message.reply_text(f"Задача {job_id} запущена. Остановка: /stop")
             elif action == "status":
                 await self.status(update, context)
                 rows = []
@@ -587,12 +623,18 @@ class Panel:
             try:
                 payload = self.store.account(account["id"])
                 client = make_client(StringSession(payload["session"]), payload["options"])
-                await client.connect()
-                if not await client.is_user_authorized():
-                    raise InputError(f"Аккаунт {account['id']}: сессия отозвана")
-                async with asyncio.timeout(120):
-                    items = await prepare(client, settings["targets"], issues,
-                                          mode=settings["mode"], post_count=settings["post_count"])
+                async with asyncio.timeout(35):
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                        raise InputError(f"Аккаунт {account['id']}: сессия отозвана")
+                try:
+                    async with asyncio.timeout(PREVIEW_TIMEOUT):
+                        await prepare(client, settings["targets"], issues, prepared=items,
+                                      mode=settings["mode"], post_count=settings["post_count"])
+                except TimeoutError:
+                    issues.append({"id": "preview-timeout", "title": "Проверка списка прервана по времени",
+                                   "source": "", "reason": "Не весь список успел провериться за 120 секунд. "
+                                   "Проверенные посты сохранены в плане. Для проверки остатка разбейте список на части."})
             except errors.FloodWaitError:
                 raise
             except Exception as exc:
@@ -600,7 +642,7 @@ class Panel:
                                "source": "", "reason": error_text(exc)})
             finally:
                 if client:
-                    await client.disconnect()
+                    await disconnect_after_check(client)
             snapshot["accounts"].append({"account_id": account["id"], "items": items, "issues": issues})
             total += len(items) if settings["mode"] == "watch" else sum(len(i["posts"]) for i in items)
             joins += sum(not i["joined"] for i in items)
@@ -652,8 +694,7 @@ class Panel:
         await message.reply_document(file, caption="sent — отправлено; failed — не отправлено; pending — проверьте вручную.")
 
     async def on_error(self, update, context):
-        # Deliberately omit update content, request objects, tokens and traceback.
-        logging.getLogger("panel").error("Handler failed: %s", type(context.error).__name__)
+        log_panel_error(update, context.error)
 
 
 
@@ -719,7 +760,7 @@ class PublicPanel:
         self.panels.clear()
 
     async def on_error(self, update, context):
-        logging.getLogger("panel").error("Handler failed: %s", type(context.error).__name__)
+        log_panel_error(update, context.error)
 
 
 def build_app():
